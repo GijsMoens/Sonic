@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonic"
+version = "0.1.0"
+description = "SONIC: Spectral Oriented Neural Invariant Convolutions"
+readme = "README.md"
+license = {text = "CC-BY-4.0"}
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+examples = [
+    "torchvision",
+    "matplotlib",
+    "thop",
+]
+vkfft = [
+    "cupy",
+    "pyvkfft",
+]
+
+[project.urls]
+Paper = "https://openreview.net/forum?id=qDGiMrUVmc"
+
+[tool.setuptools.packages.find]
+include = ["sonic*"]
