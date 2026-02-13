@@ -14,13 +14,10 @@ results/
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
 
 .env
 *.log
-wandb/
 
 *.png
 *.jpg
-*.jpeg

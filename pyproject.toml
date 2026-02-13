@@ -19,14 +19,12 @@ examples = [
     "torchvision",
     "matplotlib",
     "thop",
-]
-vkfft = [
-    "cupy",
-    "pyvkfft",
+    "wandb",
 ]
 
 [project.urls]
-Paper = "https://openreview.net/forum?id=qDGiMrUVmc"
+Paper = "https://arxiv.org/abs/2601.19884"
 
 [tool.setuptools.packages.find]
-include = ["sonic*"]
+where = ["src"]
+

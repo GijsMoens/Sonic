@@ -4,25 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DropPath(nn.Module):
-    """Stochastic depth regularisation (drop entire residual branches)."""
-
-    def __init__(self, p: float = 0.0, dim: int = 2):
-        super().__init__()
-        self.p = float(p)
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.p == 0.0 or not self.training:
-            return x
-        keep = 1.0 - self.p
-        if self.dim == 2:
-            mask = torch.rand(x.shape[0], 1, 1, 1, device=x.device) < keep
-        else:
-            mask = torch.rand(x.shape[0], 1, 1, 1, 1, device=x.device) < keep
-        return x * mask / keep
-
-
 class ModeDropout(nn.Module):
     """Spectral mode dropout: randomly zeros entire frequency modes."""
 
@@ -39,21 +20,18 @@ class ModeDropout(nn.Module):
         mask = torch.bernoulli((1 - self.p) * torch.ones(num_modes, device=x.device))
         mask /= 1 - self.p
         view_shape = [1, num_modes] + [1] * (x.dim() - 2)
-        mask = mask.view(view_shape)
-        return x * mask
-
-
-def safe_gn_groups(C: int, max_groups: int = 32) -> int:
-    """Find the largest valid number of groups for GroupNorm."""
-    for g in range(min(C, max_groups), 0, -1):
-        if C % g == 0:
-            return g
-    return 1
+        return x * mask.view(view_shape)
 
 
 def normalize_input(dim: int, x: torch.Tensor) -> torch.Tensor:
-    """Per-sample zero-mean unit-variance normalisation over spatial dims."""
-    dims_to_reduce = tuple(range(len(x.shape)))[-dim:]
+    """Per-sample zero-mean unit-variance normalisation over channel + spatial dims.
+
+    Normalising over all non-batch dimensions (C, H, W) instead of only spatial
+    (H, W) prevents near-zero variance in individual channels (common in deeper
+    layers with small, sparse post-ReLU feature maps) from amplifying noise and
+    gradients, which otherwise leads to NaN during training.
+    """
+    dims_to_reduce = tuple(range(1, len(x.shape)))
     mean = x.to(torch.float32).mean(dim=dims_to_reduce, keepdim=True)
     var = x.to(torch.float32).var(dim=dims_to_reduce, keepdim=True, unbiased=False)
     return (x - mean) / torch.sqrt(var + 1e-5)
@@ -67,12 +45,10 @@ def pad_input(dim: int, x: torch.Tensor, pad_linear: bool):
         return x, x.shape[-3], x.shape[-2], x.shape[-1]
     if dim == 2:
         B, C, H, W = x.shape
-        padded_x = F.pad(x, (0, W, 0, H))
-        return padded_x, None, H, W
-    elif dim == 3:
+        return F.pad(x, (0, W, 0, H)), None, H, W
+    if dim == 3:
         B, C, D, H, W = x.shape
-        padded_x = F.pad(x, (0, W, 0, H, 0, D))
-        return padded_x, D, H, W
+        return F.pad(x, (0, W, 0, H, 0, D)), D, H, W
 
 
 @torch.no_grad()
@@ -85,7 +61,8 @@ def get_freq_grids_2d(H: int, W: int, dx_eff: float, dy_eff: float, device, dtyp
 
 
 @torch.no_grad()
-def get_freq_grids_3d(D: int, H: int, W: int, dz_eff: float, dx_eff: float, dy_eff: float, device, dtype):
+def get_freq_grids_3d(D: int, H: int, W: int, dz_eff: float, dx_eff: float,
+                      dy_eff: float, device, dtype):
     """Construct 3-D frequency grids for the real FFT."""
     kx = torch.fft.rfftfreq(W, d=dx_eff).to(device=device, dtype=dtype) * (2 * np.pi)
     ky = torch.fft.fftfreq(H, d=dy_eff).to(device=device, dtype=dtype) * (2 * np.pi)

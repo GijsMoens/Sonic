@@ -35,8 +35,13 @@ def conv1x1(in_planes, out_planes, stride=1, **_kwargs):
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
+def _gn(num_channels, num_groups=32):
+    """GroupNorm with clamped group count (resolution-invariant alternative to BN)."""
+    return nn.GroupNorm(min(num_groups, num_channels), num_channels)
+
+
 class SonicBottleneck(nn.Module):
-    """Bottleneck block using three Sonic operators instead of convolutions."""
+    """Bottleneck block: Conv1x1 reduce → Sonic (spectral 3x3) → Conv1x1 expand."""
 
     expansion = 4
 
@@ -44,9 +49,6 @@ class SonicBottleneck(nn.Module):
                  base_width=64, dilation=1, norm_layer=None,
                  use_sonic: bool = False, sonic_kwargs: Optional[Dict[str, Any]] = None):
         super().__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-
         self.downsample = downsample
         self.stride = stride
         self.relu = nn.ReLU(inplace=True)
@@ -54,19 +56,22 @@ class SonicBottleneck(nn.Module):
         mid = int(planes * (base_width / 64.0)) * groups
         out_ch = planes * self.expansion
 
-        self.sonic1 = Sonic2d(inplanes, mid, stride=stride, sonic_kwargs=sonic_kwargs)
-        self.bn1 = norm_layer(mid)
+        # 1x1 reduce
+        self.conv1 = conv1x1(inplanes, mid)
+        self.bn1 = _gn(mid)
 
-        self.sonic2 = Sonic2d(mid, mid, stride=1, sonic_kwargs=sonic_kwargs)
-        self.bn2 = norm_layer(mid)
+        # Sonic spectral operator (replaces 3x3 conv)
+        self.sonic2 = Sonic2d(mid, mid, stride=stride, sonic_kwargs=sonic_kwargs)
+        self.bn2 = _gn(mid)
 
-        self.sonic3 = Sonic2d(mid, out_ch, stride=1, sonic_kwargs=sonic_kwargs)
-        self.bn3 = norm_layer(out_ch)
+        # 1x1 expand
+        self.conv3 = conv1x1(mid, out_ch)
+        self.bn3 = _gn(out_ch)
 
     def forward(self, x, **resolution_kwargs):
         identity = x
 
-        out = self.sonic1(x, **resolution_kwargs)
+        out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
 
@@ -74,7 +79,7 @@ class SonicBottleneck(nn.Module):
         out = self.bn2(out)
         out = self.relu(out)
 
-        out = self.sonic3(out, **resolution_kwargs)
+        out = self.conv3(out)
         out = self.bn3(out)
 
         if self.downsample is not None:
@@ -92,7 +97,7 @@ class ResNet(nn.Module):
                  sonic_kwargs: Optional[Dict[str, Any]] = None):
         super().__init__()
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = _gn if use_sonic else nn.BatchNorm2d
         self._norm_layer = norm_layer
         self.use_sonic = use_sonic
         self.sonic_kwargs = sonic_kwargs or {}
@@ -107,14 +112,16 @@ class ResNet(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
 
-        self.conv1 = (
-            nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
-            if not use_sonic
-            else Sonic2d(3, self.inplanes, stride=2, sonic_kwargs=self.sonic_kwargs)
-        )
+        # Always use a standard conv stem – a Sonic layer at 112×112 is a
+        # huge FFT bottleneck, and the stem is just edge detection anyway.
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # Track global block index for depth-aware Sonic init scheduling.
+        self._block_idx = 0
+        self._block_total = sum(layers)
 
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
@@ -155,23 +162,31 @@ class ResNet(nn.Module):
             )
 
         layers = []
+        block_sonic_kwargs = {**self.sonic_kwargs,
+                              "depth_idx": self._block_idx,
+                              "depth_total": self._block_total}
+        self._block_idx += 1
         layers.append(block(
             self.inplanes, planes, stride, downsample, self.groups,
             self.base_width, previous_dilation, norm_layer,
-            use_sonic=self.use_sonic, sonic_kwargs=self.sonic_kwargs,
+            use_sonic=self.use_sonic, sonic_kwargs=block_sonic_kwargs,
         ))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
+            block_sonic_kwargs = {**self.sonic_kwargs,
+                                  "depth_idx": self._block_idx,
+                                  "depth_total": self._block_total}
+            self._block_idx += 1
             layers.append(block(
                 self.inplanes, planes, groups=self.groups,
                 base_width=self.base_width, dilation=self.dilation,
                 norm_layer=norm_layer, use_sonic=self.use_sonic,
-                sonic_kwargs=self.sonic_kwargs,
+                sonic_kwargs=block_sonic_kwargs,
             ))
         return SequentialWithKwargs(*layers)
 
     def forward(self, x, **resolution_kwargs):
-        x = self.conv1(x, **resolution_kwargs)
+        x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
@@ -187,6 +202,22 @@ class ResNet(nn.Module):
         return x
 
 
+def resnet_sonic(layers=(1, 1, 1, 1), M_modes=128, **kwargs):
+    """Construct a shallow SONIC-ResNet with fewer blocks and richer spectral capacity.
+
+    Sonic already provides a global receptive field per layer (FFT-based),
+    so deep stacking is unnecessary.  Defaults: 4 blocks with 128 modes
+    (~7.4M params) vs. ResNet-50-Sonic's 16 blocks with 32 modes (~14.7M).
+    """
+    kwargs.setdefault("sonic_kwargs", {})
+    kwargs["sonic_kwargs"].setdefault("M_modes", M_modes)
+    kwargs["sonic_kwargs"].setdefault("normalize_input", False)
+    return ResNet(SonicBottleneck, list(layers), use_sonic=True, **kwargs)
+
+
 def resnet50_sonic(**kwargs):
     """Construct a ResNet-50 model with SONIC blocks."""
+    kwargs.setdefault("sonic_kwargs", {})
+    kwargs["sonic_kwargs"].setdefault("M_modes", 32)
+    kwargs["sonic_kwargs"].setdefault("normalize_input", False)
     return ResNet(SonicBottleneck, [3, 4, 6, 3], use_sonic=True, **kwargs)

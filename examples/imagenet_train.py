@@ -1,8 +1,14 @@
-"""ImageNet training script for SONIC-ResNet50.
+"""ImageNet training script for SONIC-ResNet.
 
 Usage::
 
     python examples/imagenet_train.py /path/to/imagenet --epochs 120
+
+    # shallow default (4 blocks, 128 modes, ~7.4M params)
+    python examples/imagenet_train.py /path/to/imagenet
+
+    # ResNet-50 depth (16 blocks, 32 modes, ~14.7M params)
+    python examples/imagenet_train.py /path/to/imagenet --layers 3 4 6 3 --modes 32
 
 Supports single-GPU, DataParallel, and DistributedDataParallel training.
 """
@@ -11,7 +17,6 @@ import argparse
 import os
 import random
 import shutil
-import time
 import warnings
 
 import torch
@@ -24,7 +29,12 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
-from resnet50_sonic import resnet50_sonic
+from resnet50_sonic import resnet_sonic
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 best_acc1 = 0
@@ -36,9 +46,8 @@ def main():
     parser.add_argument("--epochs", default=120, type=int)
     parser.add_argument("--start-epoch", default=0, type=int)
     parser.add_argument("-b", "--batch-size", default=256, type=int)
-    parser.add_argument("--lr", default=0.1, type=float)
-    parser.add_argument("--momentum", default=0.9, type=float)
-    parser.add_argument("--wd", default=1e-4, type=float, dest="weight_decay")
+    parser.add_argument("--lr", default=1e-2, type=float)
+    parser.add_argument("--wd", default=0.05, type=float, dest="weight_decay")
     parser.add_argument("-j", "--workers", default=12, type=int)
     parser.add_argument("-p", "--print-freq", default=1000, type=int)
     parser.add_argument("--resume", default="", type=str)
@@ -46,12 +55,24 @@ def main():
     parser.add_argument("--seed", default=None, type=int)
     parser.add_argument("--gpu", default=None, type=int)
     parser.add_argument("--ckt-path", default="checkpoints", type=str)
-    parser.add_argument("--world-size", default=-1, type=int)
+    parser.add_argument("--world-size", default=1, type=int)
     parser.add_argument("--rank", default=-1, type=int)
     parser.add_argument("--dist-url", default="tcp://224.66.41.62:23456", type=str)
     parser.add_argument("--dist-backend", default="nccl", type=str)
     parser.add_argument("--multiprocessing-distributed", action="store_true")
+    parser.add_argument("--warmup-epochs", default=5, type=int, help="LR warmup epochs")
+    parser.add_argument("--wandb", action="store_true", help="enable wandb logging")
+    parser.add_argument("--wandb-project", default="sonic-imagenet", type=str)
+    parser.add_argument("--wandb-run-name", default=None, type=str)
+    parser.add_argument("--layers", nargs=4, type=int, default=[1, 1, 1, 1],
+                        metavar=("L1", "L2", "L3", "L4"),
+                        help="blocks per stage (default: 1 1 1 1)")
+    parser.add_argument("--modes", type=int, default=128,
+                        help="Sonic M_modes per block (default: 128)")
     args = parser.parse_args()
+
+    if args.wandb and wandb is None:
+        raise ImportError("wandb is required when --wandb is set. Install with: pip install wandb")
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -97,9 +118,14 @@ def main_worker(gpu, ngpus_per_node, args):
             rank=args.rank,
         )
 
-    model = resnet50_sonic()
+    is_main = (not args.distributed) or args.rank == 0
 
-    if (not args.distributed) or args.rank == 0:
+    if args.wandb and is_main:
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
+
+    model = resnet_sonic(layers=args.layers, M_modes=args.modes)
+
+    if is_main:
         total_params = sum(p.numel() for p in model.parameters())
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Parameters: {total_params:,} total ({total_params/1e6:.2f}M), "
@@ -122,9 +148,8 @@ def main_worker(gpu, ngpus_per_node, args):
         model = torch.nn.DataParallel(model).cuda()
 
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    optimizer = torch.optim.SGD(
-        model.parameters(), args.lr,
-        momentum=args.momentum, weight_decay=args.weight_decay,
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
 
     if args.resume and os.path.isfile(args.resume):
@@ -139,11 +164,20 @@ def main_worker(gpu, ngpus_per_node, args):
         optimizer.load_state_dict(checkpoint["optimizer"])
         print(f"=> loaded checkpoint (epoch {checkpoint['epoch']})")
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.epochs - args.start_epoch,
         last_epoch=args.start_epoch - 1,
     )
+    if args.warmup_epochs > 0 and args.start_epoch == 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, total_iters=args.warmup_epochs,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[args.warmup_epochs],
+        )
+    else:
+        scheduler = cosine
     cudnn.benchmark = True
 
     # Data loading
@@ -189,14 +223,26 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        train(train_loader, model, criterion, optimizer, epoch, args)
-        acc1 = validate(val_loader, model, criterion, args)
+        train_loss, train_acc1, train_acc5 = train(train_loader, model, criterion, optimizer, epoch, args)
+        acc1, acc5 = validate(val_loader, model, criterion, args)
         scheduler.step()
 
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        if (not args.distributed) or args.rank == 0:
+        if args.wandb and is_main:
+            wandb.log({
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "train/acc1": train_acc1,
+                "train/acc5": train_acc5,
+                "val/acc1": acc1,
+                "val/acc5": acc5,
+                "val/best_acc1": best_acc1,
+                "lr": optimizer.param_groups[0]["lr"],
+            })
+
+        if is_main:
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
@@ -211,6 +257,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
+    loss_sum, top1_sum, top5_sum, total = 0.0, 0.0, 0.0, 0
     for i, (images, target) in enumerate(train_loader):
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
@@ -223,10 +270,18 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         loss.backward()
         optimizer.step()
 
-        if i % args.print_freq == 0:
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        bs = images.size(0)
+        loss_sum += loss.item() * bs
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        top1_sum += acc1[0].item() * bs
+        top5_sum += acc5[0].item() * bs
+        total += bs
+
+        if i % args.print_freq == 0 and (not args.distributed or args.rank == 0):
             print(f"Epoch [{epoch}][{i}/{len(train_loader)}]  "
                   f"Loss: {loss.item():.4e}  Acc@1: {acc1[0]:.2f}  Acc@5: {acc5[0]:.2f}")
+
+    return loss_sum / total, top1_sum / total, top5_sum / total
 
 
 def validate(val_loader, model, criterion, args):
@@ -246,8 +301,9 @@ def validate(val_loader, model, criterion, args):
 
     top1_avg = top1_sum / total
     top5_avg = top5_sum / total
-    print(f" * Acc@1 {top1_avg:.3f}  Acc@5 {top5_avg:.3f}")
-    return top1_avg
+    if not args.distributed or args.rank == 0:
+        print(f" * Acc@1 {top1_avg:.3f}  Acc@5 {top5_avg:.3f}")
+    return top1_avg, top5_avg
 
 
 def save_checkpoint(state, is_best, ckt_dir="checkpoints"):

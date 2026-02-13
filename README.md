@@ -59,11 +59,14 @@ python examples/synthshape.py --epochs 2000 --modes 64
 ## Citation
 
 ```bibtex
-@inproceedings{sonic2026,
-    title     = {{SONIC}: Spectral Oriented Neural Invariant Convolutions},
-    booktitle = {International Conference on Learning Representations},
-    year      = {2026},
-    url       = {https://openreview.net/forum?id=qDGiMrUVmc}
+@misc{moens2026sonicspectralorientedneural,
+      title={SONIC: Spectral Oriented Neural Invariant Convolutions}, 
+      author={Gijs Joppe Moens and Regina Beets-Tan and Eduardo H. P. Pooch},
+      year={2026},
+      eprint={2601.19884},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2601.19884}, 
 }
 ```
 

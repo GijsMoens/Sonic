@@ -374,14 +374,14 @@ class NiffBlock(nn.Module):
 
 
 class SonicBlock(nn.Module):
-    """Single Sonic block with BN and residual."""
+    """Single Sonic block with GroupNorm and residual."""
 
     def __init__(self, in_channels, out_channels, M_modes, is_stem=False,
-                 sonic_kwargs=None, norm_layer=nn.BatchNorm2d):
+                 sonic_kwargs=None):
         super().__init__()
         self.sonic = Sonic(dim=2, in_channels=in_channels, num_hidden=out_channels,
                            M_modes=M_modes, **(sonic_kwargs or {}))
-        self.bn_main = norm_layer(out_channels)
+        self.bn_main = nn.GroupNorm(8, out_channels)
         self.proj = nn.Conv2d(in_channels, out_channels, 1, bias=False) if in_channels != out_channels else nn.Identity()
         self.relu = nn.ReLU(inplace=True)
 
@@ -636,7 +636,16 @@ def evaluate_model_under_perturbations(model, device, args, perturb_type, values
             elif perturb_type == "noise":
                 x_p, y_p = apply_gaussian_noise(x, v), y
             elif perturb_type == "rescaling":
-                x_p, y_p = apply_rescaling_xy(x, y, v)
+                if getattr(model, "model_type", "") == "sonic" and v != 1.0:
+                    # Run on the naturally-resized tensor (no crop/pad artifacts)
+                    # and tell Sonic the effective grid spacing.
+                    B_s, C_s, H_orig, W_orig = x.shape
+                    new_H = max(4, int(round(H_orig * v)))
+                    new_W = max(4, int(round(W_orig * v)))
+                    x_p = F.interpolate(x, (new_H, new_W), mode="bilinear", align_corners=False)
+                    y_p = F.interpolate(to_bchw(y).float(), (new_H, new_W), mode="nearest").round().long()
+                else:
+                    x_p, y_p = apply_rescaling_xy(x, y, v)
             elif perturb_type == "rotation":
                 x_p, y_p = apply_rotation_xy(x, y, v)
             elif perturb_type == "translation":
@@ -648,8 +657,14 @@ def evaluate_model_under_perturbations(model, device, args, perturb_type, values
             else:
                 raise ValueError(f"Unknown perturbation: {perturb_type}")
             with torch.no_grad(), torch.amp.autocast(device_type=device, enabled=(device == "cuda")):
-                logits = model(x_p)
+                fwd_kwargs = {}
+                if perturb_type == "rescaling" and v != 1.0 and getattr(model, "model_type", "") == "sonic":
+                    fwd_kwargs = {"dx": 1.0 / v, "dy": 1.0 / v}
+                logits = model(x_p, **fwd_kwargs)
                 preds = torch.argmax(logits, dim=1, keepdim=True)
+                # Resize predictions to match y_p if spatial dims differ
+                if preds.shape[-2:] != y_p.shape[-2:]:
+                    preds = F.interpolate(preds.float(), y_p.shape[-2:], mode="nearest").long()
                 results[v].append(multiclass_dice(preds, y_p, args.num_classes, 0).item())
     return {v: float(np.mean(vals)) for v, vals in results.items()}
 
@@ -780,7 +795,7 @@ if __name__ == "__main__":
     parser.add_argument("--bs", type=int, default=24)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--wd", type=float, default=1e-3)
-    parser.add_argument("--train_noise", type=float, default=0.1)
+    parser.add_argument("--train_noise", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--out", type=str, default="./results")
@@ -790,6 +805,7 @@ if __name__ == "__main__":
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
     models_to_run = ["sonic", "conv", "vit", "niff", "gfnet"]
+    # models_to_run = ["sonic"]
     trained_models: Dict[str, nn.Module] = {}
     model_stats: Dict[str, dict] = {}
     device = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
