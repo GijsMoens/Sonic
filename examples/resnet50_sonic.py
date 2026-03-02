@@ -1,223 +1,221 @@
-"""ResNet-50 backbone with SONIC blocks replacing standard convolutions."""
+"""Sonic classification architecture.
 
-from typing import Any, Dict, Optional
+All spatial mixing is done by bandlimited Sonic operators.
+Channel mixing uses 1x1 convolutions with GELU.
+
+Architecture
+------------
+- 4-stage hierarchical backbone (dims=[64,128,256,512], depths=[3,3,9,3])
+- SonicBlock: Sonic for spatial mixing, 1x1 conv MLP for channel mixing
+- Classification head: GroupNorm -> GAP -> Linear
+"""
+
+from typing import List
 
 import torch
 import torch.nn as nn
 
 from sonic import Sonic
 
+_SIZE_CONFIGS = {
+    "tiny": dict(
+        dims=[64, 128, 256, 512],
+        depths=[2, 2, 6, 2],
+        mlp_ratio=[4, 4, 2, 1],
+    ),
+    "normal": dict(
+        dims=[64, 128, 256, 512],
+        depths=[3, 3, 9, 3],
+        mlp_ratio=4.0,
+    ),
+    "large": dict(
+        dims=[96, 192, 384, 768],
+        depths=[3, 3, 9, 3],
+        mlp_ratio=4.0,
+    ),
+}
 
-class SequentialWithKwargs(nn.Sequential):
-    """Sequential container that forwards ``**kwargs`` to every module."""
 
-    def forward(self, x, **kwargs):
-        for module in self._modules.values():
-            x = module(x, **kwargs)
-        return x
+class DropPath(nn.Module):
+    """Stochastic depth: drop the entire residual branch with probability *p*."""
 
-
-class Sonic2d(nn.Module):
-    """Thin wrapper: optional pooling + Sonic operator."""
-
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1,
-                 sonic_kwargs: Optional[Dict[str, Any]] = None):
+    def __init__(self, p: float = 0.0):
         super().__init__()
-        self.pool = nn.Identity() if stride == 1 else nn.AvgPool2d(kernel_size=stride, stride=stride)
-        self.op = Sonic(dim=2, in_channels=in_ch, num_hidden=out_ch, **(sonic_kwargs or {}))
+        self.p = p
 
-    def forward(self, x: torch.Tensor, **resolution_kwargs):
-        x = self.pool(x)
-        return self.op(x, **resolution_kwargs)
-
-
-def conv1x1(in_planes, out_planes, stride=1, **_kwargs):
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-
-def _gn(num_channels, num_groups=32):
-    """GroupNorm with clamped group count (resolution-invariant alternative to BN)."""
-    return nn.GroupNorm(min(num_groups, num_channels), num_channels)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        keep = 1.0 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = torch.rand(shape, device=x.device, dtype=x.dtype).add_(keep).floor_()
+        return x * mask / keep
 
 
-class SonicBottleneck(nn.Module):
-    """Bottleneck block: Conv1x1 reduce → Sonic (spectral 3x3) → Conv1x1 expand."""
+class LayerScale(nn.Module):
+    """Per-channel learnable scaling initialised to a small value."""
 
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None,
-                 use_sonic: bool = False, sonic_kwargs: Optional[Dict[str, Any]] = None):
+    def __init__(self, dim: int, init_value: float = 1e-6):
         super().__init__()
-        self.downsample = downsample
-        self.stride = stride
-        self.relu = nn.ReLU(inplace=True)
+        self.gamma = nn.Parameter(init_value * torch.ones(dim))
 
-        mid = int(planes * (base_width / 64.0)) * groups
-        out_ch = planes * self.expansion
-
-        # 1x1 reduce
-        self.conv1 = conv1x1(inplanes, mid)
-        self.bn1 = _gn(mid)
-
-        # Sonic spectral operator (replaces 3x3 conv)
-        self.sonic2 = Sonic2d(mid, mid, stride=stride, sonic_kwargs=sonic_kwargs)
-        self.bn2 = _gn(mid)
-
-        # 1x1 expand
-        self.conv3 = conv1x1(mid, out_ch)
-        self.bn3 = _gn(out_ch)
-
-    def forward(self, x, **resolution_kwargs):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.sonic2(out, **resolution_kwargs)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma.view(1, -1, *([1] * (x.ndim - 2)))
 
 
-class ResNet(nn.Module):
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
-                 groups=1, width_per_group=64, replace_stride_with_dilation=None,
-                 norm_layer=None, *, use_sonic: bool = False,
-                 sonic_kwargs: Optional[Dict[str, Any]] = None):
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = _gn if use_sonic else nn.BatchNorm2d
-        self._norm_layer = norm_layer
-        self.use_sonic = use_sonic
-        self.sonic_kwargs = sonic_kwargs or {}
-        self.inplanes = 64
-        self.dilation = 1
+class SonicBlock(nn.Module):
+    """Sonic block: Sonic for spatial mixing, 1x1 conv for channel mixing.
 
-        if replace_stride_with_dilation is None:
-            replace_stride_with_dilation = [False, False, False]
-        if len(replace_stride_with_dilation) != 3:
-            raise ValueError("replace_stride_with_dilation should be None or a 3-element tuple")
+    Structure (two residual connections):
+        Spatial: GN -> Sonic -> LayerScale -> DropPath + x
+        Channel: GN -> Conv1x1 -> GELU -> Conv1x1 -> LayerScale -> DropPath + x
 
-        self.groups = groups
-        self.base_width = width_per_group
-
-        # Always use a standard conv stem – a Sonic layer at 112×112 is a
-        # huge FFT bottleneck, and the stem is just edge detection anyway.
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = norm_layer(self.inplanes)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # Track global block index for depth-aware Sonic init scheduling.
-        self._block_idx = 0
-        self._block_total = sum(layers)
-
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
-                                       dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
-                                       dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-                                       dilate=replace_stride_with_dilation[2])
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.zeros_(m.bias)
-
-    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
-        norm_layer = self._norm_layer
-        downsample = None
-        previous_dilation = self.dilation
-
-        if dilate:
-            if self.use_sonic:
-                raise NotImplementedError("replace_stride_with_dilation not supported in Sonic mode.")
-            self.dilation *= stride
-            stride = 1
-
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                norm_layer(planes * block.expansion),
-            )
-
-        layers = []
-        block_sonic_kwargs = {**self.sonic_kwargs,
-                              "depth_idx": self._block_idx,
-                              "depth_total": self._block_total}
-        self._block_idx += 1
-        layers.append(block(
-            self.inplanes, planes, stride, downsample, self.groups,
-            self.base_width, previous_dilation, norm_layer,
-            use_sonic=self.use_sonic, sonic_kwargs=block_sonic_kwargs,
-        ))
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            block_sonic_kwargs = {**self.sonic_kwargs,
-                                  "depth_idx": self._block_idx,
-                                  "depth_total": self._block_total}
-            self._block_idx += 1
-            layers.append(block(
-                self.inplanes, planes, groups=self.groups,
-                base_width=self.base_width, dilation=self.dilation,
-                norm_layer=norm_layer, use_sonic=self.use_sonic,
-                sonic_kwargs=block_sonic_kwargs,
-            ))
-        return SequentialWithKwargs(*layers)
-
-    def forward(self, x, **resolution_kwargs):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x, **resolution_kwargs)
-        x = self.layer2(x, **resolution_kwargs)
-        x = self.layer3(x, **resolution_kwargs)
-        x = self.layer4(x, **resolution_kwargs)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-
-def resnet_sonic(layers=(1, 1, 1, 1), M_modes=128, **kwargs):
-    """Construct a shallow SONIC-ResNet with fewer blocks and richer spectral capacity.
-
-    Sonic already provides a global receptive field per layer (FFT-based),
-    so deep stacking is unnecessary.  Defaults: 4 blocks with 128 modes
-    (~7.4M params) vs. ResNet-50-Sonic's 16 blocks with 32 modes (~14.7M).
+    Set *mlp_ratio=0* to skip the channel-mixing branch.
     """
-    kwargs.setdefault("sonic_kwargs", {})
-    kwargs["sonic_kwargs"].setdefault("M_modes", M_modes)
-    kwargs["sonic_kwargs"].setdefault("normalize_input", False)
-    return ResNet(SonicBottleneck, list(layers), use_sonic=True, **kwargs)
+
+    def __init__(self, dim: int, mlp_ratio: float = 4.0,
+                 drop_path: float = 0.0, sonic_kwargs: dict = None):
+        super().__init__()
+        sk = dict(sonic_kwargs or {})
+        sk.setdefault("normalize_input", False)
+
+        self.norm1 = nn.GroupNorm(1, dim)
+        self.sonic = Sonic(dim=2, in_channels=dim, num_hidden=dim, **sk)
+        self.ls1 = LayerScale(dim)
+        self.drop1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.has_mlp = mlp_ratio > 0
+        if self.has_mlp:
+            mlp_hidden = int(dim * mlp_ratio)
+            self.norm2 = nn.GroupNorm(1, dim)
+            self.pwconv1 = nn.Conv2d(dim, mlp_hidden, kernel_size=1)
+            self.act = nn.GELU()
+            self.pwconv2 = nn.Conv2d(mlp_hidden, dim, kernel_size=1)
+            self.ls2 = LayerScale(dim)
+            self.drop2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x = x + self.drop1(self.ls1(self.sonic(self.norm1(x), **kwargs)))
+        if self.has_mlp:
+            h = self.pwconv2(self.act(self.pwconv1(self.norm2(x))))
+            x = x + self.drop2(self.ls2(h))
+        return x
 
 
-def resnet50_sonic(**kwargs):
-    """Construct a ResNet-50 model with SONIC blocks."""
-    kwargs.setdefault("sonic_kwargs", {})
-    kwargs["sonic_kwargs"].setdefault("M_modes", 32)
-    kwargs["sonic_kwargs"].setdefault("normalize_input", False)
-    return ResNet(SonicBottleneck, [3, 4, 6, 3], use_sonic=True, **kwargs)
+class SonicBackbone(nn.Module):
+    """4-stage hierarchical backbone using SonicBlocks.
+
+    Args:
+        dims: Channel dimensions per stage, e.g. [64, 128, 256, 512].
+        depths: Number of blocks per stage, e.g. [3, 3, 9, 3].
+        drop_path_rate: Maximum stochastic depth rate (linearly increasing).
+        mlp_ratio: MLP expansion ratio.  A single float applied to all stages,
+            or a list of per-stage floats (must match ``len(dims)``).
+        sonic_kwargs: Dict forwarded to every Sonic instance.
+    """
+
+    def __init__(self, dims: List[int] = [96, 192, 384, 768],
+                 depths: List[int] = [3, 3, 9, 3],
+                 drop_path_rate: float = 0.2,
+                 mlp_ratio: "float | list[float]" = 4.0,
+                 sonic_kwargs: dict = None):
+        super().__init__()
+        self.dims = dims
+        self.depths = depths
+        self.num_stages = len(dims)
+
+        if isinstance(mlp_ratio, (int, float)):
+            mlp_ratios = [float(mlp_ratio)] * self.num_stages
+        else:
+            mlp_ratios = [float(r) for r in mlp_ratio]
+            if len(mlp_ratios) != self.num_stages:
+                raise ValueError(
+                    f"mlp_ratio list length {len(mlp_ratios)} != num_stages {self.num_stages}"
+                )
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
+            nn.GroupNorm(1, dims[0]),
+        )
+
+        self.downsamples = nn.ModuleList()
+        for i in range(self.num_stages - 1):
+            self.downsamples.append(nn.Sequential(
+                nn.GroupNorm(1, dims[i]),
+                nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2),
+            ))
+
+        total_blocks = sum(depths)
+        dp_rates = torch.linspace(0, drop_path_rate, total_blocks).tolist()
+        block_idx = 0
+
+        self.stages = nn.ModuleList()
+        for stage_i in range(self.num_stages):
+            stage_blocks = nn.ModuleList()
+            for _ in range(depths[stage_i]):
+                stage_blocks.append(SonicBlock(
+                    dim=dims[stage_i],
+                    mlp_ratio=mlp_ratios[stage_i],
+                    drop_path=dp_rates[block_idx],
+                    sonic_kwargs=dict(sonic_kwargs or {}),
+                ))
+                block_idx += 1
+            self.stages.append(stage_blocks)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> List[torch.Tensor]:
+        x = self.stem(x)
+        features = []
+        for stage_i, stage_blocks in enumerate(self.stages):
+            for block in stage_blocks:
+                x = block(x, **kwargs)
+            features.append(x)
+            if stage_i < len(self.downsamples):
+                x = self.downsamples[stage_i](x)
+        return features
+
+
+class SonicClassifier(nn.Module):
+    """Sonic backbone + classification head.
+
+    Head: GroupNorm -> AdaptiveAvgPool2d(1) -> Linear
+    """
+
+    def __init__(self, n_classes: int = 1000, **backbone_kwargs):
+        super().__init__()
+        self.backbone = SonicBackbone(**backbone_kwargs)
+        last_dim = self.backbone.dims[-1]
+        self.norm = nn.GroupNorm(1, last_dim)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(last_dim, n_classes)
+        nn.init.normal_(self.fc.weight, 0, 0.01)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        features = self.backbone(x, **kwargs)
+        x = self.pool(self.norm(features[-1]))
+        return self.fc(torch.flatten(x, 1))
+
+
+def sonic_net(n_classes: int = 1000, drop_path_rate: float = 0.2,
+              sonic_kwargs: dict = None, M_modes: int = 128,
+              size: str = "normal"):
+    """Build a SonicClassifier.
+
+    Args:
+        size: ``'tiny'`` (~5.7M), ``'normal'`` (~15.0M), or ``'large'`` (~31.7M).
+    """
+    if size not in _SIZE_CONFIGS:
+        raise ValueError(f"size must be one of {list(_SIZE_CONFIGS)}, got '{size}'")
+
+    cfg = _SIZE_CONFIGS[size].copy()
+    sk = dict(sonic_kwargs or {})
+    sk.setdefault("normalize_input", False)
+    sk.setdefault("M_modes", M_modes)
+    sk.setdefault("bandlimit", True)
+
+    return SonicClassifier(
+        n_classes=n_classes,
+        drop_path_rate=drop_path_rate,
+        sonic_kwargs=sk,
+        **cfg,
+    )

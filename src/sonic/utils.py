@@ -51,6 +51,52 @@ def pad_input(dim: int, x: torch.Tensor, pad_linear: bool):
         return F.pad(x, (0, W, 0, H, 0, D)), D, H, W
 
 
+def unit_complex(shape, norm_dim, dtype):
+    """Create a unit-normalised complex tensor returned as a (real, imag) pair."""
+    re = torch.randn(*shape, dtype=torch.float32)
+    im = torch.randn(*shape, dtype=torch.float32)
+    n = (re**2 + im**2).sum(norm_dim, keepdim=True).sqrt().clamp_min(1e-12)
+    return (re / n).to(dtype), (im / n).to(dtype)
+
+
+def init_direction_angles(dim, M, fix_v, v_noise, dtype):
+    """Initialise spherical direction angles for *M* spectral modes.
+
+    2-D: evenly-spaced theta in (0, pi), with optional jitter.
+    3-D: Fibonacci-lattice (theta, phi), with optional jitter.
+
+    Returns ``(theta, phi)`` where *phi* is ``None`` for ``dim == 2``.
+    """
+    if dim == 2:
+        theta0 = torch.linspace(0, np.pi, M + 2, dtype=torch.float32)[1:-1]
+        if not fix_v:
+            theta0 = theta0 + v_noise * torch.randn(M, dtype=torch.float32)
+        return theta0.to(dtype), None
+
+    golden = (1 + np.sqrt(5)) / 2
+    indices = torch.arange(M, dtype=torch.float32)
+    theta0 = torch.acos(1 - 2 * (indices + 0.5) / (2 * M))
+    phi0 = 2 * np.pi * indices / golden
+    if not fix_v:
+        theta0 = theta0 + v_noise * torch.randn(M, dtype=torch.float32)
+        phi0 = phi0 + v_noise * torch.randn(M, dtype=torch.float32)
+    return theta0.to(dtype), phi0.to(dtype)
+
+
+def angles_to_unit_vectors(dim, theta, phi, dtype):
+    """Convert spherical angles to unit direction vectors of shape ``(dim, M)``."""
+    if dim == 2:
+        t = theta.float()
+        return torch.stack([torch.cos(t), torch.sin(t)], dim=0).to(dtype)
+
+    t, p = theta.float(), phi.float()
+    return torch.stack([
+        torch.sin(t) * torch.cos(p),
+        torch.sin(t) * torch.sin(p),
+        torch.cos(t),
+    ], dim=0).to(dtype)
+
+
 @torch.no_grad()
 def get_freq_grids_2d(H: int, W: int, dx_eff: float, dy_eff: float, device, dtype):
     """Construct 2-D frequency grids for the real FFT."""

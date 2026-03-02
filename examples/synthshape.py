@@ -804,7 +804,8 @@ if __name__ == "__main__":
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
-    models_to_run = ["sonic", "conv", "vit", "niff", "gfnet"]
+    # models_to_run = ["sonic", "conv", "vit", "niff", "gfnet"]
+    models_to_run = ["sonic", "conv"]
     # models_to_run = ["sonic"]
     trained_models: Dict[str, nn.Module] = {}
     model_stats: Dict[str, dict] = {}
